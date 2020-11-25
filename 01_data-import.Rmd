@@ -1,0 +1,20 @@
+---
+title: "01_data-import"
+output:
+  pdf_document: default
+  html_document:
+    df_print: paged
+---
+
+```{bash}
+wget https://mothur.s3.us-east-2.amazonaws.com/wiki/miseqsopdata.zip
+```
+```{bash}
+unzip miseqsopdata.zip
+```
+```{bash}
+sudo apt-get install libglpk-dev
+```
+
+
+

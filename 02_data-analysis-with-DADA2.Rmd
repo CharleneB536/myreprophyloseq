@@ -1,0 +1,199 @@
+---
+title: "Dada2 tutorial"
+output:
+  pdf_document: default
+  html_notebook: default
+---
+
+```{r}
+library("dada2")
+```
+
+
+```{r}
+path <- "~/MiSeq_SOP" # CHANGE ME to the directory containing the fastq files after unzipping.
+list.files(path)
+```
+
+
+```{r}
+# Forward and reverse fastq filenames have format: SAMPLENAME_R1_001.fastq and SAMPLENAME_R2_001.fastq
+fnFs <- sort(list.files(path, pattern="_R1_001.fastq", full.names = TRUE))
+fnRs <- sort(list.files(path, pattern="_R2_001.fastq", full.names = TRUE))
+# Extract sample names, assuming filenames have format: SAMPLENAME_XXX.fastq
+sample.names <- sapply(strsplit(basename(fnFs), "_"), `[`, 1)
+```
+
+```{r}
+plotQualityProfile(fnFs[1:2])
+```
+
+#Inspecter les profils de qualité des reads
+
+```{r}
+plotQualityProfile(fnRs[1:2])
+```
+
+#Filtrer et couper
+
+
+```{r}
+# Place filtered files in filtered/ subdirectory
+filtFs <- file.path(path, "filtered", paste0(sample.names, "_F_filt.fastq.gz"))
+filtRs <- file.path(path, "filtered", paste0(sample.names, "_R_filt.fastq.gz"))
+names(filtFs) <- sample.names
+names(filtRs) <- sample.names
+```
+
+```{r}
+out <- filterAndTrim(fnFs, filtFs, fnRs, filtRs, truncLen=c(240,160),
+              maxN=0, maxEE=c(2,2), truncQ=2, rm.phix=TRUE,
+              compress=TRUE, multithread=TRUE) # On Windows set multithread=FALSE
+head(out)
+```
+
+#Apprentissage des erreurs
+
+dada2 calcul un modèle d'erreur a partir des données de séquencage. On applique cette méthode sur les read forward (Fw) puis reverse (Rv)
+
+```{r}
+errF <- learnErrors(filtFs, multithread=TRUE)
+```
+
+```{r}
+errR <- learnErrors(filtRs, multithread=TRUE)
+```
+```{r}
+plotErrors(errF, nominalQ=TRUE)
+```
+Probabilité d'une erreur de séquencage en fonction du Qscore de la position considérée (maximum pour A par exemple). Par contre, les autres courbes montrent les probabilités d'erreurs de séquencage (quelle est la probabilité qu'un A soit changé en un C). Quand on a un trait au score de qualité élevé, on a une faible probabilité que un A donne un C. Quand on a un score de qualité plutôt faible (Q10 par exemple) la probabilité qu'un A donne un C est plus élevée.
+
+#Inférence d'échantillon
+
+On crée une nouvelle variable dadaFs qui recoit le résultat de dada = modèle d'erreur pour corriger ses données
+
+```{r}
+dadaFs <- dada(filtFs, err=errF, multithread=TRUE)
+```
+
+```{r}
+dadaRs <- dada(filtRs, err=errR, multithread=TRUE)
+```
+
+```{r}
+dadaFs[[1]]
+```
+#Aligner les R1 et les R2 en un contig
+
+Amplicon de la partie V4 de l'ARN 16 S avec des primers on obtient des fragments de 250 pb
+Read 1 : 240 pb et Read 2 : 160 pb donc il y a un chevauchement entre les deux séquences, on peut ainsi aligner les deux reads et former des contigs
+
+```{r}
+mergers <- mergePairs(dadaFs, filtFs, dadaRs, filtRs, verbose=TRUE)
+# Inspect the merger data.frame from the first sample
+head(mergers[[1]])
+```
+
+#Construction d'une table d'observation
+
+En partant de l'abondance de chacune des séquences dans chacun des échantillons, on va construire une table d'observation et on crée un objet seqtab avec en ligne le nom des échantillon et en colonne les séquences età l'intérieur le nombre de fois où l'on observe l'échantillon
+
+```{r}
+seqtab <- makeSequenceTable(mergers)
+dim(seqtab)
+```
+On va regarder la distribution des longueurs de séquence
+
+```{r}
+# Inspect distribution of sequence lengths
+table(nchar(getSequences(seqtab)))
+```
+
+On a une seule séquence qui fait 251 nucléotides par exemple.
+
+#Supprimer les chimères
+
+Création de chimère pendant l'amplification de l'ADN
+
+```{r}
+seqtab.nochim <- removeBimeraDenovo(seqtab, method="consensus", multithread=TRUE, verbose=TRUE)
+dim(seqtab.nochim)
+```
+
+Sur les 293 séquences uniques, il a identifié 61 chimères = 1/5. Chaque séquence unique peut être présente plusieurs fois donc cela n'est pas énorme
+
+On peut calculer le ratio entre le nombre de chimère et l'ensemble des abondances relatives des séquences dans les échantillons :
+
+```{r}
+1-sum(seqtab.nochim)/sum(seqtab)
+```
+Il y a 3,5 % de séquences chimériques dans notre jeu de donnée
+
+Il faut faire attention que les séquences utilisées ne contiennent plus les primers car ces derniers pourront être considérés comme chimères (taux trop important de chimères au final)
+
+#Suivre les reads dans le pipeline (résumé des filtres qualité)
+
+getN est une variable qui prend la forme d'une fonction. cbind permet la concaténation. 
+
+```{r}
+getN <- function(x) sum(getUniques(x))
+track <- cbind(out, sapply(dadaFs, getN), sapply(dadaRs, getN), sapply(mergers, getN), rowSums(seqtab.nochim))
+# If processing a single sample, remove the sapply calls: e.g. replace sapply(dadaFs, getN) with getN(dadaFs)
+colnames(track) <- c("input", "filtered", "denoisedF", "denoisedR", "merged", "nonchim")
+rownames(track) <- sample.names
+head(track)
+```
+
+Evolution du nombre de séquences à chaque itération. On est parti de 7793 paires de read à 6539 paires de contigs. 
+
+#Assignation d'une taxonomie
+
+Il faut un algorithme d'assignation de taxonomie et une base de donnée de référence.
+
+```{bash}
+wget https://zenodo.org/record/3986799/files/silva_nr99_v138_train_set.fa.gz
+```
+L'assignation va aller jusqu'à un seuil d'erreur prédéfini
+
+```{r}
+taxa <- assignTaxonomy(seqtab.nochim, "~/silva_nr99_v138_train_set.fa.gz", multithread=TRUE)
+```
+
+
+
+```{bash}
+wget https://zenodo.org/record/3986799/files/silva_nr99_v138_wSpecies_train_set.fa.gz
+```
+
+```{bash}
+wget https://zenodo.org/record/3986799/files/silva_species_assignment_v138.fa.gz
+```
+```{r}
+taxa<- addSpecies(taxa, "~/silva_species_assignment_v138.fa.gz")
+```
+
+```{r}
+taxa.print <- taxa #Removing sequence rownames for display only
+rownames(taxa.print) <- NULL
+head(taxa.print)
+```
+
+#Evaluer la précision
+
+L'un des échantillon inclus était une "communauté fictive" dans laquelle un mélange de 20 souches connues a été séquencé
+
+```{r}
+unqs.mock <- seqtab.nochim["Mock",]
+unqs.mock <- sort(unqs.mock[unqs.mock>0], decreasing=TRUE) # Drop ASVs absent in the Mock
+cat("DADA2 inferred", length(unqs.mock), "sample sequences present in the Mock community.\n")
+```
+
+```{r}
+mock.ref <- getSequences(file.path(path, "HMP_MOCK.v35.fasta"))
+match.ref <- sum(sapply(names(unqs.mock), function(x) any(grepl(x, mock.ref))))
+cat("Of those,", sum(match.ref), "were exact matches to the expected reference sequences.\n")
+```
+Cette fausse communauté contenait 20 souches bactériennes. DADA2 a identifié 20 ASV qui correspondent tous exactement aux génomes de référence des membres attendus de la communauté. Le taux d'erreur résiduel après le pipeline DADA2 pour cet échantillon est de 0% 
+
+
+
